@@ -1,8 +1,8 @@
+
 'use client';
 
-// NOTE: This file is intentionally **heavily commented** so you can read it like a story.
-// The comments explain *what* each line does and *why* we wrote it that way.
-
+// NOTE: This file is intentionally **heavily commented**
+// The comments explain *what* each line does and *why* I wrote it that way.
 
 import { useEffect, useMemo, useRef, useState } from 'react'; // React hooks for state, lifecycle, memoization, and refs
 import { postBacktest, type BacktestResponse } from '../lib/api'; // Our typed API client to call the backend (adjust the path if needed)
@@ -154,6 +154,16 @@ export default function Page() {
     if (!data) return [] as { date: string; value: number }[]; // empty when no result yet
     return data.series.map((p) => ({ date: p.date, value: p.adj_close * data.shares }));
   }, [data]); // recompute only when the result changes
+
+  // 
+  // NEW (clarity feature): Start/End adjusted prices for cross‑checking with Yahoo
+  // Why: users often compare our **portfolio value** with the last **stock price** they
+  // see on Yahoo. Showing both start/end **adjusted close** prices makes the math obvious:
+  // final portfolio value ≈ shares × (end adjusted price).
+  // We memoize to recompute only when a new backtest result arrives.
+  const startPrice = useMemo(() => (data ? data.series[0]?.adj_close ?? null : null), [data]);
+  const endPrice   = useMemo(() => (data ? data.series[data.series.length - 1]?.adj_close ?? null : null), [data]);
+  // 
 
   // 
   // Download CSV of the series with derived portfolio value
@@ -324,9 +334,13 @@ export default function Page() {
             <StatCard label="CAGR" value={fmtPct(data.cagr)} type="pct" raw={data.cagr} />
             <StatCard label="Shares" value={data.shares.toFixed(6)} />
 
+            {/* NEW: show raw stock prices (adjusted close) for cross‑checking with Yahoo */}
+            {startPrice != null && <StatCard label="Start price (adj)" value={fmtCurrency(startPrice)} />}
+            {endPrice   != null && <StatCard label="End price (adj)"   value={fmtCurrency(endPrice)} />}
+
             {/* Chart of portfolio value over time */}
             <div className="lg:col-span-3 rounded-2xl border border-white/10 bg-white/5 p-4 backdrop-blur">
-              <div className="mb-2 text-xs uppercase tracking-wide text-zinc-400">Portfolio value</div>
+              <div className="mb-2 text-xs uppercase tracking-wide text-zinc-400">Portfolio value ($)</div>
               <ValueChart data={chartData} />
             </div>
           </section>
@@ -487,6 +501,9 @@ function ValueChart({ data }: { data: { date: string; value: number }[] }) {
     </div>
   );
 }
+
+
+
 
 
 
