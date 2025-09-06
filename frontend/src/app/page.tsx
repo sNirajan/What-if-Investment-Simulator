@@ -30,10 +30,10 @@ export default function Page() {
   // Controlled input state (what the user types)
   // Default values make snapping visible (start is a weekend)
   // 
-  const [ticker, setTicker] = useState('TSLA'); // e.g., stock symbol
-  const [amount, setAmount] = useState<number>(100); // how many dollars to invest at start
-  const [start, setStart] = useState('2016-01-03'); // requested start date (YYYY‑MM‑DD)
-  const [end, setEnd] = useState('2016-12-30'); // requested end date (YYYY‑MM‑DD)
+  const [ticker, setTicker] = useState('NVDA'); // e.g., stock symbol
+  const [amount, setAmount] = useState<string>('100'); // how many dollars to invest at start
+  const [start, setStart] = useState('2020-01-05'); // requested start date (YYYY‑MM‑DD)
+  const [end, setEnd] = useState('2025-09-06'); // requested end date (YYYY‑MM‑DD)
   const [copied, setCopied] = useState(false);  // copy status for copy permalink 
 
   // 
@@ -71,7 +71,7 @@ export default function Page() {
       // Call the typed API client. Backend validates and computes the result.
       const res = await postBacktest({
         ticker,
-        amount: Number(amount), // ensure number type
+        amount: Number(amount || '0'), // coerce string → number safely (empty => 0)
         start_date: start,
         end_date: end,
         cadence: 'lump_sum', // MVP cadence (buy once at start)
@@ -84,7 +84,7 @@ export default function Page() {
       try {
         const q = new URLSearchParams({
           ticker,
-          amount: String(amount),
+          amount: (amount && amount !== '.') ? amount : '0',  // avoid empty or lone "."
           start,
           end,
         }).toString();
@@ -129,8 +129,15 @@ export default function Page() {
     const iso = /^\d{4}-\d{2}-\d{2}$/; // simple YYYY‑MM‑DD check
     let changed = false; // track if we touched any state
 
+    // AFTER (amount is a string). Accepting only numeric-ish text, strip leading zeros.
+    const numish = (s: string) => /^\d*\.?\d*$/.test(s); // digits w/ optional single dot
+
     if (qTicker) { setTicker(qTicker.toUpperCase()); changed = true; } // normalize ticker case
-    if (qAmount && !Number.isNaN(Number(qAmount))) { setAmount(Number(qAmount)); changed = true; }
+    if (qAmount && numish(qAmount)) {
+      const cleaned = qAmount.replace(/^0+(?=\d)/, ''); // keep "0.5" intact, turn "02300" -> "2300"
+      setAmount(cleaned);                               // pass a string to setAmount
+      changed = true;
+    }
     if (qStart && iso.test(qStart)) { setStart(qStart); changed = true; }
     if (qEnd && iso.test(qEnd)) { setEnd(qEnd); changed = true; }
 
@@ -162,7 +169,7 @@ export default function Page() {
   // final portfolio value ≈ shares × (end adjusted price).
   // We memoize to recompute only when a new backtest result arrives.
   const startPrice = useMemo(() => (data ? data.series[0]?.adj_close ?? null : null), [data]);
-  const endPrice   = useMemo(() => (data ? data.series[data.series.length - 1]?.adj_close ?? null : null), [data]);
+  const endPrice = useMemo(() => (data ? data.series[data.series.length - 1]?.adj_close ?? null : null), [data]);
   // 
 
   // 
@@ -264,14 +271,44 @@ export default function Page() {
             />
           </Field>
 
-          <Field label="Amount (USD)">
+          {/* <Field label="Amount (USD)">
             <input
               className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-zinc-100 placeholder-zinc-400 outline-none transition focus-visible:ring-2 focus-visible:ring-indigo-400/70 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-900"
-              type="number" // numeric input
+              type="text" // text input
               value={amount} // controlled value
               onChange={(e) => setAmount(Number(e.target.value))} // coerce to number
             />
+          </Field> */}
+
+          <Field label="Amount (USD)">
+            <input
+              // Using text + inputMode so mobile shows numeric keypad but we keep full control
+              type="text"
+              inputMode="decimal"            // mobile numeric keyboard
+              pattern="^\d*\.?\d*$"          // (advisory) digits with optional single dot
+              className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2
+               text-zinc-100 placeholder-zinc-400 outline-none transition
+               focus-visible:ring-2 focus-visible:ring-indigo-400/70
+               focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-900"
+              value={amount}
+              onChange={(e) => {
+                const v = e.target.value;
+
+                // 1) Allowing empty so users can clear the field without it snapping to 0
+                if (v === '') { setAmount(''); return; }
+
+                // 2) Blocking non-numeric characters except a single dot
+                if (!/^\d*\.?\d*$/.test(v)) return;
+
+                // 3) Removing *leading* zeros only when followed by a digit (keeps "0.5" as-is)
+                const cleaned = v.replace(/^0+(?=\d)/, '');
+
+                setAmount(cleaned);
+              }}
+              placeholder="e.g., 100"
+            />
           </Field>
+
 
           <Field label="Start (YYYY‑MM‑DD)">
             <input
@@ -336,7 +373,7 @@ export default function Page() {
 
             {/* NEW: show raw stock prices (adjusted close) for cross‑checking with Yahoo */}
             {startPrice != null && <StatCard label="Start price (adj)" value={fmtCurrency(startPrice)} />}
-            {endPrice   != null && <StatCard label="End price (adj)"   value={fmtCurrency(endPrice)} />}
+            {endPrice != null && <StatCard label="End price (adj)" value={fmtCurrency(endPrice)} />}
 
             {/* Chart of portfolio value over time */}
             <div className="lg:col-span-3 rounded-2xl border border-white/10 bg-white/5 p-4 backdrop-blur">
