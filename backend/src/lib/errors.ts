@@ -10,6 +10,13 @@
 import type { NextFunction, Request, Response } from 'express';
 import { ZodError } from 'zod';
 
+function hasLegacyHttpStatus(err: unknown): err is Error & { status: number; detail?: unknown } {
+  if (!(err instanceof Error)) return false;
+  const maybeStatus = (err as { status?: unknown }).status;
+  return typeof maybeStatus === 'number' && Number.isInteger(maybeStatus) && maybeStatus >= 400 && maybeStatus <= 599;
+}
+
+
 /**
  * AppError: throw this for business/expected failures.
  * Example: new AppError(422, "Insufficient data")
@@ -50,7 +57,16 @@ export function errorMiddleware(
     return res.status(400).json({ error: 'ValidationError', details: err.flatten() });
   }
 
-  // 3) Anything else is unexpected → 500
+  // 3) Backward-compatibility: plain Error objects with `status`.
+  // Some older code paths throw `Error` and attach { status, detail }.
+  if (hasLegacyHttpStatus(err)) {
+    const legacy = err as Error & { status: number; detail?: unknown };
+    const body: { error: string; detail?: string } = { error: legacy.message || 'Error' };
+    if (typeof legacy.detail === 'string') body.detail = legacy.detail;
+    return res.status(legacy.status).json(body);
+  }
+
+  // 4) Anything else is unexpected → 500
   console.error('Unhandled error:', err);
   return res.status(500).json({ error: 'InternalServerError' });
 }
