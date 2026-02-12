@@ -1,8 +1,8 @@
 /**
  * Price series provider.
  * - If STUB_DATA=true → deterministic 2-point series for tests/dev.
- * - Else → fetch real daily adjusted closes via yahoo-finance2.
- * - Snap start/end to nearest prior trading day (≤ requested dates).
+ * - Else → fetch real daily adjusted closes via yahoo-finance2 chart API.
+ * - Snap start to next trading day (>= start), end to previous trading day (<= end).
  * - Cache results by (ticker,start,end) to avoid repeated fetches.
  */
 import yahooFinance from 'yahoo-finance2';
@@ -10,6 +10,17 @@ import { env } from './config.js';     // ← no .js extension in TS when using 
 import { cache } from './cache.js';
 
 export type PricePoint = { date: string; adj_close: number };
+
+const MAX_PROVIDER_ATTEMPTS = 4;
+
+function isRateLimitedError(msg: string): boolean {
+  const lowered = msg.toLowerCase();
+  return lowered.includes('too many requests') || lowered.includes('429');
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // --- Date helpers -----------------------------------------------------------
 
@@ -76,28 +87,59 @@ export async function getAdjustedSeries(
   const bufferBefore = new Date(start.getTime() - 10 * 86_400_000);
   const bufferAfter  = new Date(end.getTime()   +  2 * 86_400_000);
 
-  let rows: any[] = [];
+  type ChartQuote = { date?: Date | string; adjclose?: number | null; close?: number | null };
+
+  let rows: ChartQuote[] = [];
   try {
-    rows = await yahooFinance.historical(ticker, {
-      period1: bufferBefore,
-      period2: bufferAfter,
-      interval: '1d',
-    });
+    for (let attempt = 1; attempt <= MAX_PROVIDER_ATTEMPTS; attempt++) {
+      try {
+        const chart = await yahooFinance.chart(ticker, {
+          period1: bufferBefore,
+          period2: bufferAfter,
+          interval: '1d',
+          return: 'array',
+        });
+
+        rows = (chart?.quotes ?? []) as ChartQuote[];
+        break;
+      } catch (providerErr) {
+        const msg = providerErr instanceof Error ? providerErr.message : String(providerErr);
+        if (!isRateLimitedError(msg) || attempt === MAX_PROVIDER_ATTEMPTS) {
+          throw providerErr;
+        }
+
+        const backoffMs = 400 * 2 ** (attempt - 1);
+        await sleep(backoffMs);
+      }
+    }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     const err: any = new Error('Price provider error');
-    err.status = 502;
-    err.detail = msg;
+
+    if (isRateLimitedError(msg)) {
+      err.status = 429;
+      err.detail = 'Rate-limited by price provider. Retry after ~30-60 seconds.';
+    } else {
+      err.status = 502;
+      err.detail = msg;
+    }
+
     throw err;
   }
 
   // Normalize to { date, adj_close } and sort ASC
   const series: PricePoint[] = (rows || [])
-    .filter((r) => r && r.adjClose != null && r.date)
-    .map((r) => ({
-      date: fmt(new Date(r.date)),
-      adj_close: Number(r.adjClose),
-    }))
+    .reduce<PricePoint[]>((acc, r) => {
+      if (!r?.date) return acc;
+      if (r.adjclose == null && r.close == null) return acc;
+
+      acc.push({
+        date: fmt(new Date(r.date)),
+        adj_close: Number(r.adjclose ?? r.close),
+      });
+
+      return acc;
+    }, [])
     .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 
   if (series.length === 0) {
