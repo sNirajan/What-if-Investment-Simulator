@@ -17,7 +17,8 @@ import { z } from 'zod';
 const Env = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.string().regex(/^\d+$/).default('8080'),    // keep as string, coerce letter
-  ALLOWED_ORIGIN: z.string().optional(),              // optional CORS origin
+  ALLOWED_ORIGIN: z.string().optional(),              // legacy single CORS origin
+  ALLOWED_ORIGINS: z.string().optional(),             // comma-separated CORS origins
   STUB_DATA: z.string().optional(), // "true" | "false" (strings from .env)
 });
 

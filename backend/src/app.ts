@@ -15,6 +15,7 @@
 import express from 'express';
 import cors from 'cors';
 import { env } from './lib/config.js';
+import { parseAllowedOrigins } from './lib/cors.js';
 import { errorMiddleware, notFound } from './lib/errors.js';
 import { router as backtest } from './routes/backtest.js';
 import { prisma } from './lib/db.js';
@@ -25,8 +26,21 @@ export const app = express();
 app.use(express.json());
 
 // Allow browser frontends to call our API.
-// In dev, default to http://localhost:3000; in prod, use ALLOWED_ORIGIN.
-app.use(cors({ origin: env.ALLOWED_ORIGIN || 'http://localhost:3000' }));
+// Supports ALLOWED_ORIGIN (legacy) and ALLOWED_ORIGINS (comma-separated).
+const configuredOrigins = parseAllowedOrigins(env.ALLOWED_ORIGINS, env.ALLOWED_ORIGIN);
+const allowedOrigins = configuredOrigins.length > 0 ? configuredOrigins : ['http://localhost:3000'];
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Allow non-browser and same-origin requests (no Origin header).
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+
+      return callback(new Error(`CORS blocked for origin: ${origin}`));
+    },
+  })
+);
 
 // Simple liveness check for load balancers + local debugging.
 app.get('/api/v1/health', (_req, res) =>
