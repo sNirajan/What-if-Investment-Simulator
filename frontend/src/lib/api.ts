@@ -56,10 +56,18 @@ async function request<T>(path: string, options: RequestInit): Promise<T> {
   const data: unknown = await res.json().catch(() => null);
 
   if (!res.ok) {
-    const errorData = data as { error?: string; message?: string; details?: unknown } | null;
-    const msg = errorData?.error || errorData?.message || `Request failed (${res.status})`;
-    const err = new Error(msg) as Error & { status?: number; details?: unknown };
+    const errorData = data as {
+      error?: string;
+      message?: string;
+      detail?: string;
+      details?: unknown;
+    } | null;
+
+    const baseMsg = errorData?.error || errorData?.message || `Request failed (${res.status})`;
+    const msg = errorData?.detail ? `${baseMsg}: ${errorData.detail}` : baseMsg;
+    const err = new Error(msg) as Error & { status?: number; detail?: string; details?: unknown };
     err.status = res.status;
+    if (errorData?.detail) err.detail = errorData.detail;
     if (errorData?.details) err.details = errorData.details; // Zod validation details
     throw err;
   }
