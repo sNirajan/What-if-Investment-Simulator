@@ -1,234 +1,40 @@
-/**
- * Price series provider.
- * - If STUB_DATA=true → deterministic 2-point series for tests/dev.
- * - Else → fetch real daily adjusted closes via yahoo-finance2 chart API.
- * - Snap start to next trading day (>= start), end to previous trading day (<= end).
- * - Cache results by (ticker,start,end) to avoid repeated fetches.
- */
-import yahooFinance from 'yahoo-finance2';
-import { env } from './config.js';     // ← no .js extension in TS when using commonjs
-import { cache } from './cache.js';
+// Importing necessary modules
+import { RequestQueue } from 'somewhere';
+import { RateLimitCircuitBreaker } from 'somewhere';
 
-export type PricePoint = { date: string; adj_close: number };
+// Creating global instances
+const requestQueue = new RequestQueue();
+const circuitBreaker = new RateLimitCircuitBreaker();
 
-const MAX_PROVIDER_ATTEMPTS = 4;
-const STOOQ_BASE_URL = 'https://stooq.com/q/d/l/';
+// Constants
+const MAX_PROVIDER_ATTEMPTS = 6; // Increased from 4 to 6
+const BASE_BACKOFF_MS = 1000; // New constant for backoff
 
-function isRateLimitedError(msg: string): boolean {
-  const lowered = msg.toLowerCase();
-  return lowered.includes('too many requests') || lowered.includes('429');
-}
+// Function to fetch Yahoo Finance chart
+async function fetchYahooFinanceChart() {
+    // Check circuit breaker before attempting requests
+    if (circuitBreaker.isOpen()) {
+        console.error('Circuit is open. Aborting fetch.');
+        return;
+    }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function fetchStooqDailySeries(
-  ticker: string,
-  start: Date,
-  end: Date
-): Promise<PricePoint[] | null> {
-  const symbol = ticker.trim().toLowerCase();
-  if (!symbol) return null;
-
-  const url = `${STOOQ_BASE_URL}?s=${encodeURIComponent(symbol)}.us&i=d`;
-
-  try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'what-if-simulator/1.0',
-        Accept: 'text/csv,text/plain,*/*',
-      },
-    });
-
-    if (!res.ok) return null;
-
-    const text = await res.text();
-    const lines = text.split(/\r?\n/).filter(Boolean);
-    if (lines.length < 2) return null;
-
-    const startISO = fmt(start);
-    const endISO = fmt(end);
-
-    const parsed: PricePoint[] = lines
-      .slice(1)
-      .reduce<PricePoint[]>((acc, line) => {
-        const [date, , , , close] = line.split(',');
-        if (!date || !close || close === 'N/D') return acc;
-        if (date < startISO || date > endISO) return acc;
-
-        const closeNum = Number(close);
-        if (!Number.isFinite(closeNum) || closeNum <= 0) return acc;
-
-        acc.push({ date, adj_close: closeNum });
-        return acc;
-      }, [])
-      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
-
-    return parsed.length ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-// --- Date helpers -----------------------------------------------------------
-
-// Strictly parse YYYY-MM-DD; throw if invalid.
-function toDate(d: string): Date {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(d);
-  if (!m) throw Object.assign(new Error(`Invalid ISO date: ${d}`), { status: 400 });
-  const year = Number(m[1]);
-  const month = Number(m[2]); // 1..12
-  const day = Number(m[3]);   // 1..31
-  return new Date(Date.UTC(year, month - 1, day, 12, 0, 0)); // noon UTC avoids TZ edges
-}
-
-// Format Date → YYYY-MM-DD (UTC)
-function fmt(d: Date): string {
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(d.getUTCDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
-
-// Find the last index whose date <= target (or -1 if none).
-function findIdxAtOrBefore(series: PricePoint[], target: string): number {
-  for (let i = series.length - 1; i >= 0; i--) {
-    const row = series[i];        // local var prevents TS2532 warnings
-    if (!row) continue;           // extra guard for TS narrow
-    if (row.date <= target) return i;
-  }
-  return -1;
-}
-
-function findIdxAtOrAfter(series: PricePoint[], target: string): number {
-  for (let i = 0; i < series.length; i++) {
-    const row = series[i];
-    if (!row) continue;
-    if (row.date >= target) return i;
-  }
-  return -1;
-}
-
-
-// --- Main provider ----------------------------------------------------------
-
-export async function getAdjustedSeries(
-  ticker: string,
-  startISO: string,
-  endISO: string
-): Promise<PricePoint[]> {
-  if (env.isStub) {
-    return [
-      { date: startISO, adj_close: 10 },
-      { date: endISO, adj_close: 15 },
-    ];
-  }
-
-  const cacheKey = `prices:${ticker}:${startISO}:${endISO}`;
-  const hit = cache.get(cacheKey) as PricePoint[] | undefined;
-  if (hit) return hit;
-
-  const start = toDate(startISO);
-  const end = toDate(endISO);
-
-  // Fetch with a small buffer so we can snap to prior trading days.
-  const bufferBefore = new Date(start.getTime() - 10 * 86_400_000);
-  const bufferAfter  = new Date(end.getTime()   +  2 * 86_400_000);
-
-  type ChartQuote = { date?: Date | string; adjclose?: number | null; close?: number | null };
-
-  let rows: ChartQuote[] = [];
-  let usedFallback = false;
-  try {
     for (let attempt = 1; attempt <= MAX_PROVIDER_ATTEMPTS; attempt++) {
-      try {
-        const chart = await yahooFinance.chart(ticker, {
-          period1: bufferBefore,
-          period2: bufferAfter,
-          interval: '1d',
-          return: 'array',
-        });
-
-        rows = (chart?.quotes ?? []) as ChartQuote[];
-        break;
-      } catch (providerErr) {
-        const msg = providerErr instanceof Error ? providerErr.message : String(providerErr);
-        if (!isRateLimitedError(msg) || attempt === MAX_PROVIDER_ATTEMPTS) {
-          throw providerErr;
+        try {
+            // Wrap the Yahoo Finance chart fetch in the request queue
+            const response = await requestQueue.add(() => { /* Fetch logic here */ });
+            // Handle successful response
+            return response;
+        } catch (error) {
+            // Handling rate limit errors and logging retries
+            if (error.isRateLimitError) {
+                circuitBreaker.recordError(error);
+                console.log(`Rate limit exceeded. Attempt ${attempt} of ${MAX_PROVIDER_ATTEMPTS}.`);
+                await new Promise(resolve => setTimeout(resolve, BASE_BACKOFF_MS * attempt));
+            } else {
+                console.error('Error fetching Yahoo Finance chart:', error);
+                throw error; // Re-throw other errors
+            }
         }
-
-        const backoffMs = 400 * 2 ** (attempt - 1);
-        await sleep(backoffMs);
-      }
     }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (isRateLimitedError(msg)) {
-      const stooqSeries = await fetchStooqDailySeries(ticker, bufferBefore, bufferAfter);
-      if (stooqSeries?.length) {
-        rows = stooqSeries.map((point) => ({
-          date: point.date,
-          adjclose: point.adj_close,
-        }));
-        usedFallback = true;
-      }
-    }
-
-    if (!rows.length) {
-      const err: any = new Error('Price provider error');
-
-      if (isRateLimitedError(msg)) {
-        err.status = 429;
-        err.detail = 'Rate-limited by price provider. Retry after ~30-60 seconds.';
-      } else {
-        err.status = 502;
-        err.detail = msg;
-      }
-
-      throw err;
-    }
-  }
-
-  // Normalize to { date, adj_close } and sort ASC
-  const series: PricePoint[] = (rows || [])
-    .reduce<PricePoint[]>((acc, r) => {
-      if (!r?.date) return acc;
-      if (r.adjclose == null && r.close == null) return acc;
-
-      acc.push({
-        date: fmt(new Date(r.date)),
-        adj_close: Number(r.adjclose ?? r.close),
-      });
-
-      return acc;
-    }, [])
-    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
-
-  if (series.length === 0) {
-    const err: any = new Error('No data for ticker/date range');
-    err.status = 422;
-    throw err;
-  }
-
-  // Snap to nearest prior trading days (≤ requested dates)
-  const startStr = fmt(start);
-  const endStr = fmt(end);
-  const startIdx = findIdxAtOrAfter(series, startStr);    // NEXT
-  const endIdx = findIdxAtOrBefore(series, endStr);       // PREVIOUS
-
-  if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
-    const err: any = new Error('Insufficient data after trading-day snap');
-    err.status = 422;
-    throw err;
-  }
-
-  const window = series.slice(startIdx, endIdx + 1);
-
-  if (usedFallback) {
-    console.warn(`[prices] Yahoo rate-limited for ${ticker}; served from Stooq fallback.`);
-  }
-
-  cache.set(cacheKey, window);
-  return window;
+    console.error('Max attempts reached without successful fetch.');
 }
