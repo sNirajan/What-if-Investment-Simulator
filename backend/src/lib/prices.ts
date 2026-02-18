@@ -12,6 +12,7 @@ import { cache } from './cache.js';
 export type PricePoint = { date: string; adj_close: number };
 
 const MAX_PROVIDER_ATTEMPTS = 4;
+const STOOQ_BASE_URL = 'https://stooq.com/q/d/l/';
 
 function isRateLimitedError(msg: string): boolean {
   const lowered = msg.toLowerCase();
@@ -20,6 +21,54 @@ function isRateLimitedError(msg: string): boolean {
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchStooqDailySeries(
+  ticker: string,
+  start: Date,
+  end: Date
+): Promise<PricePoint[] | null> {
+  const symbol = ticker.trim().toLowerCase();
+  if (!symbol) return null;
+
+  const url = `${STOOQ_BASE_URL}?s=${encodeURIComponent(symbol)}.us&i=d`;
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'what-if-simulator/1.0',
+        Accept: 'text/csv,text/plain,*/*',
+      },
+    });
+
+    if (!res.ok) return null;
+
+    const text = await res.text();
+    const lines = text.split(/\r?\n/).filter(Boolean);
+    if (lines.length < 2) return null;
+
+    const startISO = fmt(start);
+    const endISO = fmt(end);
+
+    const parsed: PricePoint[] = lines
+      .slice(1)
+      .reduce<PricePoint[]>((acc, line) => {
+        const [date, , , , close] = line.split(',');
+        if (!date || !close || close === 'N/D') return acc;
+        if (date < startISO || date > endISO) return acc;
+
+        const closeNum = Number(close);
+        if (!Number.isFinite(closeNum) || closeNum <= 0) return acc;
+
+        acc.push({ date, adj_close: closeNum });
+        return acc;
+      }, [])
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+
+    return parsed.length ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 // --- Date helpers -----------------------------------------------------------
@@ -90,6 +139,7 @@ export async function getAdjustedSeries(
   type ChartQuote = { date?: Date | string; adjclose?: number | null; close?: number | null };
 
   let rows: ChartQuote[] = [];
+  let usedFallback = false;
   try {
     for (let attempt = 1; attempt <= MAX_PROVIDER_ATTEMPTS; attempt++) {
       try {
@@ -114,17 +164,30 @@ export async function getAdjustedSeries(
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    const err: any = new Error('Price provider error');
-
     if (isRateLimitedError(msg)) {
-      err.status = 429;
-      err.detail = 'Rate-limited by price provider. Retry after ~30-60 seconds.';
-    } else {
-      err.status = 502;
-      err.detail = msg;
+      const stooqSeries = await fetchStooqDailySeries(ticker, bufferBefore, bufferAfter);
+      if (stooqSeries?.length) {
+        rows = stooqSeries.map((point) => ({
+          date: point.date,
+          adjclose: point.adj_close,
+        }));
+        usedFallback = true;
+      }
     }
 
-    throw err;
+    if (!rows.length) {
+      const err: any = new Error('Price provider error');
+
+      if (isRateLimitedError(msg)) {
+        err.status = 429;
+        err.detail = 'Rate-limited by price provider. Retry after ~30-60 seconds.';
+      } else {
+        err.status = 502;
+        err.detail = msg;
+      }
+
+      throw err;
+    }
   }
 
   // Normalize to { date, adj_close } and sort ASC
@@ -161,6 +224,11 @@ export async function getAdjustedSeries(
   }
 
   const window = series.slice(startIdx, endIdx + 1);
+
+  if (usedFallback) {
+    console.warn(`[prices] Yahoo rate-limited for ${ticker}; served from Stooq fallback.`);
+  }
+
   cache.set(cacheKey, window);
   return window;
 }
